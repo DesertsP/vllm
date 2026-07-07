@@ -14,13 +14,10 @@ import numpy.typing as npt
 from PIL import Image
 
 from vllm import envs
-from vllm.logger import init_logger
 
 from ..video import VIDEO_LOADER_REGISTRY
 from .base import MediaIO
 from .image import ImageMediaIO
-
-logger = init_logger(__name__)
 
 _VideoDecodeCacheKey = tuple[str, int, int, int, str, tuple[tuple[str, Any], ...]]
 _VideoDecodeCacheValue = tuple[npt.NDArray, dict[str, Any]]
@@ -34,12 +31,13 @@ class _InflightVideoDecode:
 
 
 class _VideoDecodeCache:
-    def __init__(self) -> None:
+    def __init__(self, max_size: int = envs.VLLM_VIDEO_DECODE_CACHE_SIZE) -> None:
         self.lock = threading.Lock()
         self.cache: OrderedDict[_VideoDecodeCacheKey, _VideoDecodeCacheValue] = (
             OrderedDict()
         )
         self.inflight: dict[_VideoDecodeCacheKey, _InflightVideoDecode] = {}
+        self.max_size: int = max_size
 
     def clear(self) -> None:
         with self.lock:
@@ -90,7 +88,6 @@ class _VideoDecodeCache:
     def get_or_load(
         self,
         key: _VideoDecodeCacheKey,
-        max_size: int,
         load: Callable[[], _VideoDecodeCacheValue],
     ) -> _VideoDecodeCacheValue:
         owner = False
@@ -120,7 +117,7 @@ class _VideoDecodeCache:
             with self.lock:
                 self.cache[key] = cached_result
                 self.cache.move_to_end(key)
-                while len(self.cache) > max_size:
+                while len(self.cache) > self.max_size:
                     self.cache.popitem(last=False)
                 inflight.result = cached_result
                 inflight.event.set()
@@ -220,7 +217,6 @@ class VideoMediaIO(MediaIO[tuple[npt.NDArray, dict[str, Any]]]):
                 self.video_loader_backend,
                 self.kwargs,
             ),
-            cache_size,
             lambda: self._load_file_uncached(filepath),
         )
 

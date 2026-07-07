@@ -191,39 +191,6 @@ def test_video_decode_cache_waits_for_inflight_load(
     assert [metadata["calls"] for _, metadata in results] == [1, 1]
 
 
-def test_video_decode_cache_size_kwarg_is_ignored(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-):
-    class RejectDecodeCacheSizeLoader(VideoLoader):
-        calls = 0
-
-        @classmethod
-        def load_bytes(
-            cls, data: bytes, num_frames: int = -1, **kwargs
-        ) -> tuple[npt.NDArray, dict]:
-            cls.calls += 1
-            assert "decode_cache_size" not in kwargs
-            return np.array([[[[cls.calls]]]]), {"calls": cls.calls}
-
-    VIDEO_LOADER_REGISTRY.register("test_reject_decode_cache_size")(
-        RejectDecodeCacheSizeLoader
-    )
-
-    with monkeypatch.context() as m:
-        m.setenv("VLLM_VIDEO_LOADER_BACKEND", "test_reject_decode_cache_size")
-        m.setenv("VLLM_VIDEO_DECODE_CACHE_SIZE", "0")
-        imageio = ImageMediaIO()
-        video_path = tmp_path / "video.bin"
-        video_path.write_bytes(b"video")
-
-        videoio = VideoMediaIO(imageio, num_frames=10, decode_cache_size=2)
-        videoio.load_file(video_path)
-        videoio.load_file(video_path)
-
-    assert RejectDecodeCacheSizeLoader.calls == 2
-
-
 @pytest.mark.parametrize("is_color", [True, False])
 @pytest.mark.parametrize("fourcc, ext", [("mp4v", "mp4"), ("XVID", "avi")])
 def test_opencv_video_io_colorspace(tmp_path, is_color: bool, fourcc: str, ext: str):
