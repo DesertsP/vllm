@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copyreg
 import functools
+import io
 import pickle
 import sys
 import threading
@@ -45,12 +47,10 @@ VLLM_RINGBUFFER_WARNING_INTERVAL = envs.VLLM_RINGBUFFER_WARNING_INTERVAL
 
 from_bytes_big = functools.partial(int.from_bytes, byteorder="big")
 
-
 # Memory fence for cross-process shared memory visibility.
 # Required for correct producer-consumer synchronization when using
 # shared memory without locks.
 _memory_fence_lock = threading.Lock()
-
 
 def memory_fence():
     """
@@ -72,13 +72,78 @@ def memory_fence():
     with _memory_fence_lock:
         pass
 
-
 def to_bytes_big(value: int, size: int) -> bytes:
     return value.to_bytes(size, byteorder="big")
 
-
 logger = init_logger(__name__)
 
+def _torch_dtype_from_name(dtype_name: str) -> torch.dtype:
+    if not dtype_name.startswith("torch."):
+        raise TypeError(f"Unsupported tensor dtype name: {dtype_name}")
+    dtype = getattr(torch, dtype_name.removeprefix("torch."), None)
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"Unsupported tensor dtype for MessageQueue: {dtype_name}")
+    return dtype
+
+def _rebuild_tensor_from_buffer(
+    buffer: Any,
+    dtype_name: str,
+    shape: tuple[int, ...],
+) -> torch.Tensor:
+    # NumPy does not expose bfloat16 as a regular dtype in all environments.
+    # Serialize bf16 tensor bytes as uint16 and restore the view on load.
+    buffer_dtype = (
+        torch.uint16
+        if dtype_name == "torch.bfloat16"
+        else _torch_dtype_from_name(dtype_name)
+    )
+    tensor = torch.frombuffer(buffer, dtype=buffer_dtype)
+    if dtype_name == "torch.bfloat16":
+        tensor = tensor.view(torch.bfloat16)
+    return tensor.reshape(shape)
+
+def _reduce_tensor_to_buffer(
+    tensor: torch.Tensor,
+) -> tuple[Any, tuple[PickleBuffer, str, tuple[int, ...]]]:
+    if tensor.device.type != "cpu":
+        raise ValueError(
+            "MessageQueue tensor out-of-band serialization only supports CPU "
+            f"tensors, got {tensor.device}"
+        )
+    tensor = tensor.detach()
+    shape = tuple(tensor.shape)
+    dtype_name = str(tensor.dtype)
+    _torch_dtype_from_name(dtype_name)
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
+    if dtype_name == "torch.bfloat16":
+        tensor = tensor.view(torch.uint16)
+    array = tensor.numpy()
+    return (_rebuild_tensor_from_buffer, (PickleBuffer(array), dtype_name, shape))
+
+_TENSOR_OOB_DISPATCH_TABLE = copyreg.dispatch_table.copy()
+_TENSOR_OOB_DISPATCH_TABLE[torch.Tensor] = _reduce_tensor_to_buffer
+
+def _tensor_oob_dumps(
+    obj: Any,
+    protocol: int,
+    buffer_callback: Any,
+) -> bytes:
+    """Pickle with a per-pickler CPU tensor OOB reducer.
+
+    Avoid modifying copyreg's process-global dispatch table; MessageQueue can be
+    used concurrently, and a global temporary Tensor reducer would affect other
+    pickles in the same process while enqueue() is running.
+    """
+    file = io.BytesIO()
+    pickler = pickle.Pickler(
+        file,
+        protocol=protocol,
+        buffer_callback=buffer_callback,
+    )
+    pickler.dispatch_table = _TENSOR_OOB_DISPATCH_TABLE
+    pickler.dump(obj)
+    return file.getvalue()
 
 LONG_WAIT_TIME_LOG_MSG = (
     "No available shared memory broadcast block found "
@@ -87,7 +152,6 @@ LONG_WAIT_TIME_LOG_MSG = (
     "time-consuming work (e.g. compilation, "
     "weight/kv cache quantization)."
 )
-
 
 class SpinCondition:
     """
@@ -199,7 +263,6 @@ class SpinCondition:
         """Notifies all readers to wake up"""
         assert not self.is_reader, "Only writers can notify"
         self.local_notify_socket.send(b"\x00")
-
 
 class ShmRingBuffer:
     def __init__(
@@ -338,7 +401,6 @@ class ShmRingBuffer:
         with self.shared_memory.buf[start:end] as buf:
             yield buf
 
-
 @dataclass
 class Handle:
     local_reader_ranks: list[int] = field(default_factory=list)
@@ -348,7 +410,6 @@ class Handle:
     local_notify_addr: str | None = None
     remote_subscribe_addr: str | None = None
     remote_addr_ipv6: bool = False
-
 
 class MessageQueue:
     def __init__(
@@ -716,7 +777,9 @@ class MessageQueue:
             total_bytes += len(raw_buf) + 4
             return False
 
-        all_buffers[0] = pickle.dumps(
+        # CPU tensors are serialized as protocol-5 out-of-band buffers so
+        # large tensor payloads can use the MessageQueue OOB/overflow path.
+        all_buffers[0] = _tensor_oob_dumps(
             obj, protocol=pickle.HIGHEST_PROTOCOL, buffer_callback=oob_callback
         )
         if self.n_local_reader > 0:
