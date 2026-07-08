@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import base64
+import json
+import struct
 import threading
 from collections import OrderedDict
 from collections.abc import Callable
@@ -21,6 +23,7 @@ from .image import ImageMediaIO
 
 _VideoDecodeCacheKey = tuple[str, int, int, int, str, tuple[tuple[str, Any], ...]]
 _VideoDecodeCacheValue = tuple[npt.NDArray, dict[str, Any]]
+_LMMS_VIDEO_JPEG_MAGIC = b"LMMSVJPG1\n"
 
 
 class _InflightVideoDecode:
@@ -199,9 +202,19 @@ class VideoMediaIO(MediaIO[tuple[npt.NDArray, dict[str, Any]]]):
                 "image/jpeg",
             )
 
-            return np.stack(
+            frames = np.stack(
                 [np.asarray(load_frame(frame_data)) for frame_data in data.split(",")]
-            ), {}
+            )
+            num_frames = int(frames.shape[0])
+            metadata = {
+                "fps": 2.0,
+                "duration": num_frames / 2.0,
+                "total_num_frames": num_frames,
+                "frames_indices": list(range(num_frames)),
+                "video_backend": "video/jpeg",
+                "do_sample_frames": False,
+            }
+            return frames, metadata
 
         return self.load_bytes(base64.b64decode(data))
 
@@ -221,8 +234,31 @@ class VideoMediaIO(MediaIO[tuple[npt.NDArray, dict[str, Any]]]):
         )
 
     def _load_file_uncached(self, filepath: Path) -> tuple[npt.NDArray, dict[str, Any]]:
+        if filepath.suffix == ".lmmsvjpg":
+            return self._load_lmms_video_jpeg_file(filepath)
         with filepath.open("rb") as f:
             return self.load_bytes(f.read())
+
+    def _load_lmms_video_jpeg_file(
+        self,
+        filepath: Path,
+    ) -> tuple[npt.NDArray, dict[str, Any]]:
+        with filepath.open("rb") as f:
+            magic = f.read(len(_LMMS_VIDEO_JPEG_MAGIC))
+            if magic != _LMMS_VIDEO_JPEG_MAGIC:
+                raise ValueError(f"Invalid lmms video jpeg file magic: {filepath}")
+            header_len = struct.unpack(">I", f.read(4))[0]
+            metadata = json.loads(f.read(header_len).decode("utf-8"))
+            frame_count = struct.unpack(">I", f.read(4))[0]
+            frames = []
+            for _ in range(frame_count):
+                payload_len = struct.unpack(">I", f.read(4))[0]
+                frame = self.image_io.load_bytes(f.read(payload_len))
+                frames.append(np.asarray(frame))
+
+        if not frames:
+            raise ValueError(f"No frames found in lmms video jpeg file: {filepath}")
+        return np.stack(frames), metadata
 
     def encode_base64(
         self,
