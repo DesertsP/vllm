@@ -497,6 +497,7 @@ class EngineArgs:
         MultiModalConfig.mm_encoder_attn_backend
     )
     io_processor_plugin: str | None = None
+    renderer_num_workers: int = 1
     skip_mm_profiling: bool = MultiModalConfig.skip_mm_profiling
     video_pruning_rate: float | None = MultiModalConfig.video_pruning_rate
     # LoRA fields
@@ -750,6 +751,10 @@ class EngineArgs:
         )
         model_group.add_argument(
             "--io-processor-plugin", **model_kwargs["io_processor_plugin"]
+        )
+        model_group.add_argument(
+            "--renderer-num-workers",
+            **model_kwargs["renderer_num_workers"],
         )
 
         # Model loading arguments
@@ -1410,6 +1415,7 @@ class EngineArgs:
             logits_processors=self.logits_processors,
             video_pruning_rate=self.video_pruning_rate,
             io_processor_plugin=self.io_processor_plugin,
+            renderer_num_workers=self.renderer_num_workers,
         )
 
     def validate_tensorizer_args(self):
